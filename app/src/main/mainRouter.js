@@ -1,9 +1,10 @@
 const { app, ipcMain, shell } = require('electron');
 const path = require('path');
-const ScannerManager = require('./scannerManager');
-const Flasher = require('./serial/flasher');
+const fs = require('fs');
+const Scanner = require('./scanner');
+const Flasher = require('./flasher');
+const Utils = require('./utils/fileUtils');
 const rendererConsole = require('./utils/rendererConsole');
-const IpcManager = require('./utils/ipcMainManager');
 const HardwareListManager = require('./hardwareListManager');
 const HandlerCreator = require('./datahandler/handler');
 
@@ -23,17 +24,14 @@ class MainRouter {
 
     constructor(mainWindow, entryServer) {
         global.$ = require('lodash');
-        rendererConsole.initialize(mainWindow);
-        this.ipcManager = new IpcManager(mainWindow);
         this.browser = mainWindow;
-        this.scannerManager = new ScannerManager(this);
+        rendererConsole.initialize(mainWindow);
+        this.scanner = new Scanner(this);
         this.server = entryServer;
         this.flasher = new Flasher();
-        this.hardwareListManager = new HardwareListManager(this);
+        this.hardwareListManager = new HardwareListManager();
 
-        this.selectedPort = undefined;
         this.config = undefined;
-        this.scanner = undefined;
         /** @type {Connector} */
         this.connector = undefined;
         this.hwModule = undefined;
@@ -43,8 +41,47 @@ class MainRouter {
         entryServer.setRouter(this);
         this.server.open();
 
-        this._resetIpcEvents();
-        this._registerIpcEvents();
+        ipcMain.on('state', (e, state) => {
+            this.onChangeState(state);
+        });
+        ipcMain.on('startScan', async (e, config) => {
+            try {
+                await this.startScan(config);
+            } catch (e) {
+                rendererConsole.error(`startScan err : `, e);
+            }
+        });
+        ipcMain.on('stopScan', () => {
+            this.close();
+        });
+        ipcMain.on('close', () => {
+            this.close();
+        });
+        ipcMain.on('requestFlash', (e, firmwareName) => {
+            this.flashFirmware(firmwareName)
+                .then(() => {
+                    if (!e.sender.isDestroyed()) {
+                        e.sender.send('requestFlash');
+                    }
+                })
+                .catch((err) => {
+                    if (!e.sender.isDestroyed()) {
+                        e.sender.send('requestFlash', err);
+                    }
+                });
+        });
+        ipcMain.on('executeDriver', (e, driverPath) => {
+            this.executeDriver(driverPath);
+        });
+        ipcMain.on('getCurrentServerModeSync', (e) => {
+            e.returnValue = this.currentServerRunningMode;
+        });
+        ipcMain.on('getCurrentCloudModeSync', (e) => {
+            e.returnValue = this.currentCloudMode;
+        });
+        ipcMain.on('requestHardwareListSync', (e) => {
+            e.returnValue = this.hardwareListManager.allHardwareList;
+        });
     }
 
     /**
@@ -56,31 +93,22 @@ class MainRouter {
      * @returns {Promise<void|Error>}
      */
     flashFirmware(firmwareName) {
-        const connectorSerialPort = this.connector && this.connector.serialPort;
-        // firmware type 이 copy 인 경우는 시리얼포트를 경유하지 않으므로 체크하지 않는다.
-        // 그러나 config 은 필요하다.
-        if (
-            this.config &&
-            (firmwareName.type === 'copy' || connectorSerialPort)
-        ) {
-            this.sendState('flash');
+        if (this.connector && this.connector.serialPort && this.config) {
             let firmware = firmwareName;
             const {
-                firmware: firmwareInConfig,
+                configfirmware,
                 firmwareBaudRate: baudRate,
                 firmwareMCUType: MCUType,
                 tryFlasherNumber: maxFlashTryCount = 10,
             } = this.config;
-            const lastSerialPortCOMPort = connectorSerialPort && connectorSerialPort.path;
+            const lastSerialPortCOMPort = this.connector.serialPort.path;
             this.firmwareTryCount = 0;
 
-            if (!firmwareName || firmwareName === '') {
-                console.warn('firmware requested without firmware info!');
-                console.warn('try to default firmware info in config file');
-                firmware = firmwareInConfig;
+            if (firmwareName === undefined || firmwareName === '') {
+                firmware = configfirmware;
             }
 
-            this.close({ saveSelectedPort: true }); // 서버 통신 중지, 시리얼포트 연결 해제
+            this.close(); // 서버 통신 중지, 시리얼포트 연결 해제
 
             const flashFunction = () => new Promise((resolve, reject) => {
                 setTimeout(() => {
@@ -100,7 +128,7 @@ class MainRouter {
                                     reject(new Error('Failed Firmware Upload'));
                                 }
                             } else {
-                                resolve(firmware);
+                                resolve();
                             }
                         })
                         .catch(reject);
@@ -108,7 +136,22 @@ class MainRouter {
             });
 
             // 에러가 발생하거나, 정상종료가 되어도 일단 startScan 을 재시작한다.
-            return flashFunction();
+            return flashFunction()
+                .then(() => {
+                    console.log('flash successed');
+                })
+                .catch((e) => {
+                    rendererConsole.error('flash failed', e);
+                    console.log('flash failed');
+                    throw e;
+                })
+                .finally(async () => {
+                    this.flasher.kill();
+                    if (firmware.afterDelay) {
+                        await new Promise((resolve) => setTimeout(resolve, firmware.afterDelay));
+                    }
+                    await this.startScan(this.config);
+                });
         } else {
             return Promise.reject(new Error('Hardware Device Is Not Connected'));
         }
@@ -141,23 +184,32 @@ class MainRouter {
             }
         }
 
-        this.sendEventToMainWindow('state', resultState, ...args);
+        if (!this.browser.isDestroyed()) {
+            this.browser.webContents.send('state', resultState, ...args);
+        }
     }
 
     notifyCloudModeChanged(mode) {
-        this.sendEventToMainWindow('cloudMode', mode);
+        if (!this.browser.isDestroyed()) {
+            this.browser.webContents.send('cloudMode', mode);
+        }
         this.currentCloudMode = mode;
     }
 
     notifyServerRunningModeChanged(mode) {
-        this.sendEventToMainWindow('serverMode', mode);
+        if (!this.browser.isDestroyed()) {
+            this.browser.webContents.send('serverMode', mode);
+        }
         this.currentServerRunningMode = mode;
     }
 
-    sendEventToMainWindow(eventName, ...args) {
-        if (!this.browser.isDestroyed()) {
-            this.browser.webContents.send(eventName, ...args);
-        }
+    /**
+     * ipcMain.on('state', ...) 처리함수
+     * @param state
+     */
+    onChangeState(state) {
+        console.log('server state', state);
+        // this.server.setState(state);
     }
 
     /**
@@ -167,21 +219,25 @@ class MainRouter {
      * @param config
      */
     async startScan(config) {
-        try {
-            this.config = config;
-            if (this.scanner) {
-                this.hwModule = require(`../../modules/${config.module}`);
-                this.sendState('scan');
-                this.scanner.stopScan();
+        this.config = config;
+        if (this.scanner) {
+            this.hwModule = require(`../../modules/${config.module}`);
+            if (this.scanner.isScanning) {
+                this.scanner.config = config;
+                return;
+            }
+            
+            if (this.scanner.isScanning) {
+                this.scanner.setConfig(config);
+            } else {
                 const connector = await this.scanner.startScan(this.hwModule, this.config);
                 if (connector) {
+                    this.sendState('connected');
                     this.connector = connector;
                     connector.setRouter(this);
                     this._connect(connector);
                 }
             }
-        } catch (e) {
-            console.error(e);
         }
     }
 
@@ -200,12 +256,7 @@ class MainRouter {
             this.scanner.stopScan();
         }
         if (this.connector) {
-            if (this.hwModule && this.hwModule.disconnect) {
-                this.hwModule.disconnect(this.connector);
-            } else {
-                this.connector.close();
-            }
-            this.sendState('disconnected');
+            this.connector.close();
         }
     }
 
@@ -274,43 +325,27 @@ class MainRouter {
 
     // 엔트리 측에서 데이터를 받아온 경우 전달
     handleServerData({ data, type }) {
-        if (!this.hwModule || !this.handler || !this.config) {
-            console.warn('hardware is not connected but entry server data is received');
+        const hwModule = this.hwModule;
+        const handler = this.handler;
+
+        if (!hwModule || !handler) {
             return;
         }
 
-        const hwModule = this.hwModule;
-        const handler = this.handler;
-        const { direct } = this.config;
+        handler.decode(data, type);
 
-        if (direct && this.connector) {
-            let result = data;
-            if (hwModule.handleRemoteData) {
-                result = hwModule.handleRemoteData(result);
-            }
-            if (hwModule.requestLocalData) {
-                result = hwModule.requestLocalData(result);
-            }
-            this.connector.send(result);
-        } else {
-            handler.decode(data, type);
-            if (hwModule.handleRemoteData) {
-                hwModule.handleRemoteData(handler);
-            }
+        if (hwModule.handleRemoteData) {
+            hwModule.handleRemoteData(handler);
         }
     }
 
     /**
      * 서버로 인코딩된 데이터를 보낸다.
      */
-    sendEncodedDataToServer(data) {
-        if (data) {
+    sendEncodedDataToServer() {
+        const data = this.handler.encode();
+        if (this.server && data) {
             this.server.send(data);
-        } else {
-            const data = this.handler && this.handler.encode();
-            if (this.server && data) {
-                this.server.send(data);
-            }
         }
     }
 
@@ -323,26 +358,23 @@ class MainRouter {
         }
     }
 
-    setConnector(connector) {
-        this.connector = connector;
-    }
-
-    /**
-     *
-     * @param option {Object=} true 인 경우, 포트선택했던 내역을 지우지 않는다.
-     */
-    close(option) {
-        const { saveSelectedPort = false } = option || {};
-
+    close() {
         if (this.server) {
             this.server.disconnectHardware();
         }
-        this.stopScan();
-        this.hwModule = undefined;
-        this.handler = undefined;
-
-        if (!saveSelectedPort) {
-            this.selectedPort = undefined;
+        if (this.connector) {
+            rendererConsole.log('disconnect');
+            if (this.hwModule.disconnect) {
+                this.hwModule.disconnect(this.connector);
+            } else {
+                this.connector.close();
+            }
+        }
+        if (this.scanner) {
+            this.scanner.stopScan();
+        }
+        if (this.handler) {
+            this.handler = undefined;
         }
     };
 
@@ -357,80 +389,20 @@ class MainRouter {
         }
 
         const asarIndex = app.getAppPath().indexOf(`${path.sep}app.asar`);
-        let sourcePath;
+        let sourcePath = '';
         if (asarIndex > -1) {
-            sourcePath = path.join(app.getAppPath(), '..', 'drivers');
+            const asarPath = app.getAppPath().substr(0, asarIndex);
+            const externalDriverPath = path.join(asarPath, 'drivers');
+            const internalDriverPath = path.resolve(app.getAppPath(), __dirname, '..', '..', 'drivers');
+            if (!fs.existsSync(externalDriverPath)) {
+                Utils.copyRecursiveSync(internalDriverPath, externalDriverPath);
+            }
+            sourcePath = externalDriverPath;
         } else {
             sourcePath = path.resolve(__dirname, '..', '..', 'drivers');
         }
 
         shell.openItem(path.resolve(sourcePath, driverPath));
-    }
-
-    _registerIpcEvents() {
-        ipcMain.on('startScan', async (e, config) => {
-            try {
-                const { hardware: { type = '' } = {} } = config || {};
-                this.scanner = this.scannerManager.getScanner(type);
-                await this.startScan(config);
-            } catch (e) {
-                rendererConsole.error('startScan err : ', e);
-            }
-        });
-        ipcMain.on('selectPort', (e, portName) => {
-            this.selectedPort = portName;
-        });
-        ipcMain.on('stopScan', () => {
-            this.stopScan();
-        });
-        ipcMain.on('close', () => {
-            this.close();
-        });
-        ipcMain.on('requestFlash', (e, firmwareName) => {
-            this.flashFirmware(firmwareName)
-                .then((firmware) => {
-                    if (!e.sender.isDestroyed()) {
-                        e.sender.send('requestFlash');
-                    }
-                    return firmware;
-                })
-                .catch((err) => {
-                    if (!e.sender.isDestroyed()) {
-                        e.sender.send('requestFlash', err);
-                    }
-                })
-                .then(async (firmware) => {
-                    this.flasher.kill();
-                    if (firmware && firmware.afterDelay) {
-                        await new Promise((resolve) => setTimeout(resolve, firmware.afterDelay));
-                    }
-                    await this.startScan(this.config);
-                });
-        });
-        ipcMain.on('executeDriver', (e, driverPath) => {
-            this.executeDriver(driverPath);
-        });
-        ipcMain.on('getCurrentServerModeSync', (e) => {
-            e.returnValue = this.currentServerRunningMode;
-        });
-        ipcMain.on('getCurrentCloudModeSync', (e) => {
-            e.returnValue = this.currentCloudMode;
-        });
-        ipcMain.on('requestHardwareListSync', (e) => {
-            e.returnValue = this.hardwareListManager.allHardwareList;
-        });
-    }
-
-    _resetIpcEvents() {
-        ipcMain.removeAllListeners('startScan');
-        ipcMain.removeAllListeners('selectPort');
-        ipcMain.removeAllListeners('stopScan');
-        ipcMain.removeAllListeners('close');
-        ipcMain.removeAllListeners('requestFlash');
-        ipcMain.removeAllListeners('executeDriver');
-        ipcMain.removeAllListeners('getCurrentServerModeSync');
-        ipcMain.removeAllListeners('getCurrentCloudModeSync');
-        ipcMain.removeAllListeners('requestHardwareListSync');
     }
 }
 

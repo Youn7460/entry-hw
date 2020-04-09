@@ -1,0 +1,30 @@
+{
+    "id": "FFFF01",
+    "name": {
+        "en": "Blacksmith Board(dongle)",
+        "ko": "대장장이 보드(동글)"
+    },
+    "category": "module",
+    "platform": ["win32", "darwin"],
+    "icon": "blacksmith_dongle.png",
+    "module": "blacksmith_dongle.js",
+        "driver": {
+        "win32-ia32": "arduino/dpinst-x86.exe",
+        "win32-x64": "arduino/dpinst-amd64.exe"
+    },
+    "url": "http://www.hanibot.com",
+    "email": "mrtinternational@google.com",
+    "reconnect": true,
+    "select_com_port": true,
+    "firmware": "blacksmith",
+    "entry": {
+        "protocol": "json"
+    },
+    "hardware": {
+        "type": "bluetooth",
+        "control": "slave",
+        "duration": 20,
+        "vendor": "Microsoft",
+        "baudRate": 57600
+    }
+}

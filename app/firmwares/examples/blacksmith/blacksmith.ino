@@ -70,7 +70,6 @@ int echoPin = 12;
 String makeBtString;
 int softSerialRX = 2;
 int softSerialTX = 3;
-unsigned long prev_time_BT=0;
 
 // LCD
 String lastLcdDataLine0;
@@ -438,12 +437,9 @@ void sendPinValues() {   //핀 값 보내기
     callOK();
   }
 
-  if (isBluetooth&& millis()-prev_time_BT<300) {
+  if (isBluetooth) {
     sendBluetooth();
     callOK();
-  }else{
-    makeBtString = "";
-    prev_time_BT=millis();
   }
 }
 
@@ -489,6 +485,7 @@ void sendBluetooth() {
   writeSerial(softSerialRX);
   writeSerial(READ_BLUETOOTH);
   writeEnd();
+  makeBtString = "";
 }
 
 void sendDigitalValue(int pinNumber) {

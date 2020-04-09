@@ -22,14 +22,19 @@ class FileUtils {
         }
     };
 
-    static copyFile(src, dest) {
+    static copyFile(src, dest, option) {
         return new Promise(((resolve, reject) => {
-            fs.copyFile(src, dest, (err) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve();
-                }
+            const crs = fs.createReadStream(src);
+            const cws = fs.createWriteStream(dest, option);
+            new Promise(((res, rej) => {
+                crs.on('error', rej);
+                cws.on('error', rej);
+                cws.on('finish', res);
+                crs.pipe(cws);
+            })).then(resolve).catch((err) => {
+                crs.destroy();
+                cws.end();
+                reject(err);
             });
         }));
     }
